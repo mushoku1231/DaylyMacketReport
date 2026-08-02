@@ -79,7 +79,11 @@ function toDate(v) {
 function fmtDate(d) {
   const dt = toDate(d);
   if (!dt) {
-    Logger.log("fmtDate: 日付として解釈できない値を受け取りました → " + Object.prototype.toString.call(d) + " / " + d);
+    // ★v3.7: 呼び出し元が分かるようスタックトレースも出す
+    let where = "";
+    try { where = "\n  呼び出し元:\n" + new Error().stack; } catch (e) {}
+    Logger.log("fmtDate: 日付として解釈できない値を受け取りました → "
+               + Object.prototype.toString.call(d) + " / " + d + where);
     return "";
   }
   return Utilities.formatDate(dt, TZ, "yyyy/MM/dd");
@@ -1226,6 +1230,13 @@ function fetchHegemonyDataViaGoogle(ss) {
  * 34. parseDateStr が Date オブジェクトをそのまま受け取れるようにした。
  *     設定シートの B列が日付型セルになっていると、プロパティに
  *     Date が入ることがあるため。
+ *
+ * ==========================================
+ * 修正履歴 (v3.7)
+ * ==========================================
+ * 35. fmtDate が値を解釈できなかったとき、スタックトレースも記録する。
+ *     v3.6 のログでは undefined を受け取ったことは分かったが、
+ *     どの呼び出し元から来たのかが特定できなかったため。
  *
  * 検証結果の要点（1999/3-2019/10、翌日終値約定、3倍換算）
  *   全期間 x3.88 / CAGR 6.8% / 最大DD -65.3% / 62取引 / 勝率54.8%
