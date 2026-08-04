@@ -12,8 +12,10 @@ const CONFIG = {
     // --- エントリー ---
     ENTRY_VIX_ABOVE: 30,        // VIXがこの値を超えたら逆張りエントリー
     USE_MA200_FILTER: false,    // true にすると「NDX終値 > 200日SMA」を追加条件にする
-                                // 注意: VIX>30 の局面はほぼ200日線割れなので、
-                                //       true にすると本戦略はほぼ発動しなくなる
+                                // ★true にしてはいけない。NDX実データ(1995-2026)で
+                                //   VIX>30単独が x58.4 に対し、200日線併用は x1.9。
+                                //   取引が83回から33回に減り、残った取引の質も落ちる。
+                                //   パニックの底は定義上200日線の下で起きるため。
     // --- エグジット ---
     TP: 0.12,                   // 利確 (v3.5で +15% から変更)
     SL: -0.15,                  // 損切り (v3.5で -12% から変更)
@@ -167,7 +169,7 @@ function recordAdvancedMarketData() {
     "S&P 500 Lv.1 (-5%)", "S&P 500 Lv.2 (-10%)", "S&P 500 Lv.3 (-20%)",
     "USD/JPY 現在値", "USD/JPY 200SMA", "為替フィルター",
     "VIX 現在値", "VIX 前日終値", "VIX 5日MA",
-    "★S&P 500 購入判定",
+    "S&P 500 スポット判定",
     "Nifty 50 現在値", "Nifty 50 アクション",
     "NASDAQ先物 動向",
     "au PAY 新規投入判定",
@@ -175,7 +177,7 @@ function recordAdvancedMarketData() {
     "au PAY 運用状況",
     "★au PAY 決済判定",
     "ACWX 現在値", "SPX/ACWX Ratio", "★覇権ステータス",
-    "NDX 現在値", "NDX 200SMA", "基準価額 基準日"
+    "NDX 現在値", "NDX 200SMA", "基準価額 基準日", "S&P500 今サイクル最大DD"
   ];
 
   if (!sheet) {
@@ -188,7 +190,8 @@ function recordAdvancedMarketData() {
   } else {
     // ★修正: 列を追加したので、既存シートのヘッダーが短ければ書き直す
     const currentHeader = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    if (currentHeader.length < headerRow.length) {
+    if (currentHeader.length !== headerRow.length
+        || currentHeader.join("\u0001") !== headerRow.join("\u0001")) {
       sheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow])
            .setFontWeight("bold").setBackground("#e6f2ff");
     }
@@ -473,9 +476,18 @@ function recordAdvancedMarketData() {
   }
 
   // ------------------------------------------
-  // S&P 500 暴落時迎撃システム
+  // S&P 500 スポット投資ゲージ (v3.8で全面改修)
+  //
+  // 旧版はLv1/Lv2/Lv3のフラグを持つ状態機械だったが、
+  // 「+2%反発かつ7日経過でLv2を全解除」する再武装が回数無制限に働き、
+  // ATHを下回り続けるかぎり1〜2週間おきに買い判定を出し続けていた。
+  // 検証(1999-2019, QQQ)では20年で402回、うち378回が再武装由来。
+  //
+  // S&P500は積立が基本で、判定はスポット投資の目安として使うため、
+  // 売買シグナルではなく「今どれくらい深いか」を示すゲージに変更した。
+  // 保有状態を持たないので、買ったかどうかをスクリプトが知る必要もない。
   // ------------------------------------------
-  const commonFilterPass = vixPrice !== null && vixMa5 !== null
+  const vixCalm = vixPrice !== null && vixMa5 !== null
     && (vixPrice < 30) && (vixPrice < vixMa5);
 
   let dropRate = null;
@@ -483,100 +495,64 @@ function recordAdvancedMarketData() {
     dropRate = (spPrice - spAth) / spAth;
   }
 
+  // ATH更新でサイクルをリセット
   const prevAth = parseFloat(props.getProperty('spPrevAth')) || 0;
   if (spAth !== null && spAth > prevAth) {
     props.setProperty('spPrevAth', spAth.toString());
-    props.setProperty('spLv1Bought', 'false');
-    ['spLv2_10', 'spLv2_12', 'spLv2_14', 'spLv2_16', 'spLv2_18']
-      .forEach(k => props.setProperty(k, 'false'));
-    props.deleteProperty('spLv2WaveBottom');
-    props.deleteProperty('spLv2LastActionDate');
-    props.setProperty('spLv3Bought', 'false');
+    props.setProperty('spCycleMaxDrop', '0');
+    // 旧版の未使用プロパティを掃除
+    ['spLv1Bought', 'spLv2_10', 'spLv2_12', 'spLv2_14', 'spLv2_16', 'spLv2_18',
+     'spLv2WaveBottom', 'spLv2LastActionDate', 'spLv3Bought']
+      .forEach(k => props.deleteProperty(k));
   }
 
-  const lv1Bought = props.getProperty('spLv1Bought') === 'true';
-  const lv2Keys = [10, 12, 14, 16, 18];
-  const lv2Flags = {};
-  lv2Keys.forEach(k => { lv2Flags[k] = props.getProperty(`spLv2_${k}`) === 'true'; });
-  let waveBottom = parseFloat(props.getProperty('spLv2WaveBottom')) || null;
-  const lastActionDate = props.getProperty('spLv2LastActionDate') || '';
-  const lv3Bought = props.getProperty('spLv3Bought') === 'true';
-
-  if (spPrice !== null && dropRate !== null && dropRate <= -0.10) {
-    if (waveBottom === null || spPrice < waveBottom) {
-      waveBottom = spPrice;
-      props.setProperty('spLv2WaveBottom', waveBottom.toString());
-    }
+  // 今サイクルの最大ドローダウンを更新
+  let prevMaxDrop = parseFloat(props.getProperty('spCycleMaxDrop'));
+  if (isNaN(prevMaxDrop)) prevMaxDrop = 0;
+  let cycleMaxDrop = prevMaxDrop;
+  if (dropRate !== null && dropRate < cycleMaxDrop) {
+    cycleMaxDrop = dropRate;
+    props.setProperty('spCycleMaxDrop', cycleMaxDrop.toString());
   }
 
-  // Lv2 全リセット判定（+2%反発 かつ 7暦日経過）
-  if (waveBottom !== null && spPrice !== null && lastActionDate !== '') {
-    const reboundPct = (spPrice - waveBottom) / waveBottom;
-    const lastDate = parseDateStr(lastActionDate);
-    if (lastDate) {
-      const daysSinceAction = Math.floor((nowDate - lastDate) / (1000 * 60 * 60 * 24));
-      if (reboundPct >= 0.02 && daysSinceAction >= 7) {
-        lv2Keys.forEach(k => {
-          lv2Flags[k] = false;
-          props.setProperty(`spLv2_${k}`, 'false');
-        });
-        props.setProperty('spLv2LastActionDate', todayStr);
-        waveBottom = spPrice;
-        props.setProperty('spLv2WaveBottom', waveBottom.toString());
-      }
-    }
-  }
+  // ★v3.9: -25/-30/-40% を追加。
+  //   実データ(S&P500 1995-2026)では、-20%を一度踏むとゲージが飽和し、
+  //   2002-2006年と2009-2012年は初到達イベントがゼロだった。
+  //   2002年のS&P500は最大-49%まで落ちているのに無反応になる。
+  const BANDS = [
+    { th: -0.40, level: 10, label: "危機" },
+    { th: -0.30, level: 9,  label: "極大" },
+    { th: -0.25, level: 8,  label: "甚大" },
+    { th: -0.20, level: 7,  label: "最大" },
+    { th: -0.18, level: 6,  label: "特大" },
+    { th: -0.16, level: 5,  label: "大" },
+    { th: -0.14, level: 4,  label: "中〜大" },
+    { th: -0.12, level: 3,  label: "中" },
+    { th: -0.10, level: 2,  label: "小〜中" },
+    { th: -0.05, level: 1,  label: "小" }
+  ];
 
   let spAction = "データ不足";
-  if (dropRate !== null && vixPrice !== null) {
-    if (dropRate <= -0.20 && !lv3Bought) {
-      spAction = "★残資金全額購入 (Lv3到達 -20% / クライシスモード)";
-      props.setProperty('spLv3Bought', 'true');
+  if (dropRate !== null) {
+    let band = null;
+    for (let i = 0; i < BANDS.length; i++) {
+      if (dropRate <= BANDS[i].th) { band = BANDS[i]; break; }
+    }
+    const ddStr = `${(dropRate * 100).toFixed(1)}%`;
+    if (!band) {
+      spAction = `積立のみ (ATHから${ddStr} / スポット水準未達)`;
     } else {
-      const subLevels = [
-        { key: 10, threshold: -0.10, label: "Lv2-A (-10%)" },
-        { key: 12, threshold: -0.12, label: "Lv2-B (-12%)" },
-        { key: 14, threshold: -0.14, label: "Lv2-C (-14%)" },
-        { key: 16, threshold: -0.16, label: "Lv2-D (-16%)" },
-        { key: 18, threshold: -0.18, label: "Lv2-E (-18%)" }
-      ];
-
-      let lv2Hit = null;
-      for (let i = subLevels.length - 1; i >= 0; i--) {
-        if (dropRate <= subLevels[i].threshold && !lv2Flags[subLevels[i].key]) {
-          lv2Hit = subLevels[i];
-          break;
-        }
+      // 今サイクルで初めてこの水準に届いた日か
+      let prevLevel = 0;
+      for (let i = 0; i < BANDS.length; i++) {
+        if (prevMaxDrop <= BANDS[i].th) { prevLevel = BANDS[i].level; break; }
       }
-
-      if (lv2Hit) {
-        if (commonFilterPass) {
-          spAction = `★購入 (${lv2Hit.label}到達 / ${exchangeFilterText})`;
-          subLevels.forEach(sl => {
-            if (dropRate <= sl.threshold) {
-              lv2Flags[sl.key] = true;
-              props.setProperty(`spLv2_${sl.key}`, 'true');
-            }
-          });
-          props.setProperty('spLv2LastActionDate', todayStr);
-        } else {
-          spAction = `待機 (${lv2Hit.label}到達 / 共通フィルター不通過: VIX=${vixPrice.toFixed(1)})`;
-        }
-      } else if (dropRate <= -0.05 && !lv1Bought) {
-        if (commonFilterPass) {
-          spAction = `★購入 (Lv1到達 -5% / ${exchangeFilterText})`;
-          props.setProperty('spLv1Bought', 'true');
-        } else {
-          spAction = "待機 (Lv1到達 / 共通フィルター不通過)";
-        }
-      } else if (dropRate > -0.05) {
-        spAction = "待機 (下落条件未達)";
-      } else if (lv1Bought && dropRate > -0.10) {
-        spAction = "待機 (Lv1購入済 / Lv2未到達)";
-      } else {
-        const boughtCount = lv2Keys.filter(k => lv2Flags[k]).length;
-        spAction = `待機 (Lv2 ${boughtCount}/5 購入済)`;
-      }
+      const first = band.level > prevLevel;
+      spAction = `スポット強度${band.level}/10 (${band.label}) `
+               + `ATHから${ddStr}`
+               + (first ? " ★本日この水準に初到達" : "")
+               + ` / 今サイクル最安 ${(cycleMaxDrop * 100).toFixed(1)}%`
+               + ` / ${vixCalm ? "VIX鎮静化" : "VIXまだ高止まり"}`;
     }
   }
 
@@ -845,7 +821,8 @@ function recordAdvancedMarketData() {
     hegRatio !== null ? formatNum(hegRatio, 4) : "N/A",
     hegStatusText,
     formatNum(ndxPrice), formatNum(ndxSma200),
-    auNavDate || "不明"
+    auNavDate || "不明",
+    dropRate !== null ? `${(cycleMaxDrop*100).toFixed(1)}%` : "N/A"
   ];
 
   sheet.appendRow(rowData);
@@ -1238,12 +1215,71 @@ function fetchHegemonyDataViaGoogle(ss) {
  *     v3.6 のログでは undefined を受け取ったことは分かったが、
  *     どの呼び出し元から来たのかが特定できなかったため。
  *
- * 検証結果の要点（1999/3-2019/10、翌日終値約定、3倍換算）
- *   全期間 x3.88 / CAGR 6.8% / 最大DD -65.3% / 62取引 / 勝率54.8%
- *   2倍相当なら x5.36 / CAGR 8.5% / 最大DD -47.7%
- *   ただし利益の大半は2000-2002年と2009年。2010年以降は CAGR -3.1%。
- *   市場滞在率は8%、20年のうち9年は発動ゼロ。
- *   損切りはルール-12%に対し実現の最悪が -30.5%(翌日約定のため)。
- *   200日線の併用は20年で15取引しか発生せず x0.79 と悪化。
- *   2020年以降は未検証。
+ * ==========================================
+ * 修正履歴 (v3.8) — S&P500をスポット投資ゲージへ変更
+ * ==========================================
+ * 36. Lv1/Lv2/Lv3のフラグ管理と再武装ロジックを全廃した。
+ *     旧実装は「+2%反発かつ7日経過でLv2の5段階を全解除」を
+ *     回数無制限に繰り返すため、ATHを下回り続けるかぎり
+ *     1〜2週間おきに買い判定を出し続けていた。
+ *     検証(1999-2019, QQQで代用)では20年で402回の購入判定が出て、
+ *     うち378回が再武装由来。購入時ドローダウンの中央値は-59%だった。
+ *     再武装を止めた場合は30回で、購入後6ヶ月の平均は+0.5%から
+ *     +14.9%へ改善した。
+ * 37. S&P500は積立が基本でスポット投資の目安として使うため、
+ *     売買シグナルではなく「今どれくらい深いか」を示すゲージにした。
+ *     M列は ★購入判定 から スポット判定 に変更。
+ *     スポット強度1〜7(-5/-10/-12/-14/-16/-18/-20%)と、
+ *     今サイクルの最安値、VIXが鎮静化しているかを併記する。
+ *     ★は「本日この水準に初到達」した日だけ付く。
+ * 38. VIXフィルタは判定を止める条件から外し、表示に変更した。
+ *     到達ベースの検証ではフィルタの有無で購入後6ヶ月が
+ *     +14.3%対+13.4%とほぼ差がなく、機会だけが31回から44回へ
+ *     減っていたため。パニックの最中かどうかは自分で判断できる。
+ * 39. 出力に「S&P500 今サイクル最大DD」列を追加。
+ * 40. ヘッダーは長さだけでなく内容が変わった場合も自動で書き直す。
+ *
+ * ==========================================
+ * 修正履歴 (v3.9) — 実データ(1995-2026)での再検証を反映
+ * ==========================================
+ * 41. スポットゲージに -25/-30/-40% のバンドを追加し、強度を1〜10に拡張。
+ *     S&P500実データでは -20% を一度踏むとゲージが飽和し、
+ *     2002-2006年と2009-2012年は初到達イベントがゼロだった。
+ *     2002年は最大 -49% まで落ちているのに無反応。
+ *     追加後の到達回数は69回→77回。到達後6ヶ月の平均は
+ *     +8.4%→+7.5% とほぼ変わらず、成績は落とさずに沈黙が消える。
+ * 42. USE_MA200_FILTER のコメントに実測値を追記した。
+ *
+ * ==========================================
+ * 検証結果の要点（すべて実データ、翌日終値約定）
+ * ==========================================
+ * [au PAY VIX>30ルール] NDX日次 1995/1-2026/7、2倍相当、利確+12%/損切-15%/期限20営業日
+ *   x58.41 / CAGR 13.7% / 最大DD -46.8% / Calmar 0.29 / 83取引 / 勝率72%
+ *   市場滞在率は12%。最大連敗2回。損切りの実現平均 -15.5%、最悪 -24.6%。
+ *   マイナスの年は1997(-1.3%) 1999(-4.4%) 2000(-5.2%) 2008(-14.7%) の4年のみ。
+ *   旧パラメータ +15%/-12% は x20.01 / CAGR 10.0% なので、v3.5の変更は31年で追認された。
+ *
+ * [エントリー条件の比較] 同期間・同エグジット、Calmarで評価
+ *   VIX>30      x58.4  CAGR13.7% DD-46.8% Calmar0.29 滞在12%  ← 採用
+ *   VIX>28      x76.2  CAGR14.7% DD-63.3% Calmar0.23 滞在15%
+ *   VIX>22      x135   CAGR16.8% DD-73.9% Calmar0.23 滞在33%
+ *   VIX>18      x217   CAGR18.6% DD-87.4% Calmar0.21 滞在51%
+ *   フィルタなし  x74.1  CAGR14.6% DD-89.5% Calmar0.16 滞在79%
+ *   2倍買い持ち   x138   CAGR16.9% DD-98.6% Calmar0.17 滞在97%
+ *   VIX>30+200日線超   x1.90  / VIX>30 かつ VIX<5日MA   x3.79  ← 併用は壊滅
+ *   閾値を下げるほど累積は増えるが、ドローダウンが耐えられない水準になる。
+ *
+ * [S&P500 スポットゲージ] S&P500日次 1995/1-2026/7、初到達69回(年2.2回)
+ *   到達後 3ヶ月 +6.5%(勝80%) / 6ヶ月 +8.4%(勝70%) / 1年 +9.0%(勝71%)
+ *   毎月積立の同期間は +2.5% / +5.0% / +10.1%
+ *   → 短期はスポットが有利、1年では積立に追いつかれる。
+ *   VIXフィルタを条件に戻してはいけない。強度1〜3の48回のうち、
+ *   その日にVIXが鎮静化していたのは3回だけで、45回を取り逃していた。
+ *
+ * [参考: 積立との比較] 毎月1単位を拠出、1995-2026
+ *   2倍に毎月積立      52.4倍 / 最大DD -98.1%
+ *   1倍NDXに毎月積立   13.8倍 / 最大DD -78.4%
+ *   VIX>30ルール      17.4倍 / 最大DD -46.6%
+ *   資金効率では積立が圧勝するが、2000年開始だと拠出額を7.3年間下回り続ける。
+ *   このスクリプトは判定を出すだけで、資金配分は扱っていない。
  */
